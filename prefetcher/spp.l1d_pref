@@ -1,8 +1,19 @@
 
 #include "cache.h"
 
+struct IPEntry {
+    uint64_t ip = 0;
+    uint64_t last_addr = 0;
+    bool valid = false;
+};
+
+static IPEntry table[64];
+
 void CACHE::l1d_prefetcher_initialize()
 {
+    for (auto &entry : table)
+        entry = IPEntry();
+
     std::cout << "SPP initialized" << std::endl;
 }
 
@@ -10,6 +21,20 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip,
                                    uint8_t cache_hit, uint8_t type,
                                    uint8_t critical_ip_flag)
 {
+    if (type == PREFETCH)
+        return;
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    IPEntry &entry = table[ip % 64];
+
+    if (!entry.valid || entry.ip != ip) {
+        entry.ip = ip;
+        entry.last_addr = cl_addr;
+        entry.valid = true;
+        return;
+    }
+
+    entry.last_addr = cl_addr;
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
