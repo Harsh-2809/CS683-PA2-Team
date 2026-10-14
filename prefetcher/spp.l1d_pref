@@ -4,6 +4,7 @@
 struct IPEntry {
     uint64_t ip = 0;
     uint64_t last_addr = 0;
+    int64_t stride = 0;
     bool valid = false;
 };
 
@@ -30,10 +31,12 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip,
     if (!entry.valid || entry.ip != ip) {
         entry.ip = ip;
         entry.last_addr = cl_addr;
+        entry.stride = 0;
         entry.valid = true;
         return;
     }
 
+    entry.stride = (int64_t)cl_addr - (int64_t)entry.last_addr;
     entry.last_addr = cl_addr;
 }
 
