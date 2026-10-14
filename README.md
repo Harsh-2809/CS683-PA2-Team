@@ -1,3 +1,14 @@
+
+echo "===== README ====="
+sed -n '1,240p' README.md
+
+echo
+echo "===== TASK 1 PREFETCHER FILES ====="
+find prefetcher -maxdepth 2 -type f -print
+
+echo
+echo "===== BUILD SCRIPT OPTIONS ====="
+./build_champsim.sh --help
 # ChampSim
 
 ChampSim is a trace-based simulator for microarchitecture research.
