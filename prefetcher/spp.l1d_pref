@@ -1,88 +1,334 @@
+// CS683 PA2 - Task 1B: Stride Pattern Prefetcher (SPP) at L1D
+//
+// Storage:
+//   IP table : 64 entries x 50 bits (valid 1, tag 10, last_addr 16,
+//              last_stride 7, conf 2, sig 12, lru 2)      = 3200 bits
+//   PT       : 512 entries x 9 bits (stride 7, conf 2)    = 4608 bits
+//   Filter   : 256 entries x 13 bits (valid 1, tag 12)    = 3328 bits
+//   Throttle : epoch_issued 9 + epoch_useful 9 + degree 3 =   21 bits
+//   Total                                                 = 11157 bits (~1.36 KB)
 
 #include "cache.h"
 
-// Track the recent memory access pattern of each instruction
+namespace spp {
+
+// IP table: 16 sets x 4 ways, one entry per load IP
+constexpr uint32_t IPT_SETS        = 16;
+constexpr uint32_t IPT_WAYS        = 4;
+constexpr uint32_t IPT_SET_BITS    = 4;
+constexpr uint32_t IPT_TAG_BITS    = 10;
+constexpr uint64_t IPT_TAG_MASK    = (1ULL << IPT_TAG_BITS) - 1;
+
+// only keep low 16 bits of last line addr, enough to get the stride
+constexpr uint32_t LAST_ADDR_BITS  = 16;
+constexpr uint64_t LAST_ADDR_MASK  = (1ULL << LAST_ADDR_BITS) - 1;
+
+constexpr uint32_t STRIDE_BITS     = 7;
+constexpr int64_t  MAX_STRIDE      = 63;     // 4KB page = 64 lines
+
+// signature = hash of last few strides of an IP
+constexpr uint32_t SIG_BITS        = 12;
+constexpr uint32_t SIG_SHIFT       = 3;
+constexpr uint32_t SIG_MASK        = (1u << SIG_BITS) - 1;
+
+// pattern table: signature -> next stride
+constexpr uint32_t PT_ENTRIES      = 512;
+constexpr uint32_t PT_INDEX_BITS   = 9;
+
+constexpr uint8_t  CONF_MAX            = 3;
+constexpr uint8_t  UNIFORM_CONF_THRESH = 2;  // same stride 3 times
+constexpr uint8_t  PT_CONF_THRESH      = 2;
+
+// remembers lines we prefetched, used to measure accuracy
+constexpr uint32_t FILTER_ENTRIES  = 256;
+constexpr uint32_t FILTER_IDX_BITS = 8;
+constexpr uint64_t FILTER_TAG_MASK = (1ULL << 12) - 1;
+
+// degree is chosen from accuracy at the end of every epoch
+constexpr uint32_t EPOCH_LEN       = 256;
+constexpr double   ACC_HIGH = 0.75, ACC_MID = 0.50, ACC_LOW = 0.25;
+constexpr int      DEG_HIGH = 4,    DEG_MID = 3,    DEG_LOW = 2,  DEG_MIN = 1;
+constexpr int      INIT_DEGREE = 3;
+
 struct IPEntry {
-    uint64_t ip = 0;
-    uint64_t last_addr = 0;
-    int64_t stride = 0;
-    uint8_t confidence = 0;
-    bool valid = false;
+    bool     valid       = false;
+    uint16_t tag         = 0;
+    uint16_t last_addr   = 0;
+    int8_t   last_stride = 0;
+    uint8_t  conf        = 0;
+    uint16_t sig         = 0;
+    uint8_t  lru         = 0;
 };
 
-static IPEntry table[64];
+struct PTEntry {
+    uint8_t stride = 0;
+    uint8_t conf   = 0;
+};
+
+struct FilterEntry {
+    bool     valid = false;
+    uint16_t tag   = 0;
+};
+
+static IPEntry     ipt[IPT_SETS][IPT_WAYS];
+static PTEntry     pt[PT_ENTRIES];
+static FilterEntry filter[FILTER_ENTRIES];
+
+static uint32_t epoch_issued = 0, epoch_useful = 0;
+static int      cur_degree   = INIT_DEGREE;
+
+// stats only
+static uint64_t stat_issued = 0, stat_useful = 0;
+static uint64_t stat_uniform_pf = 0, stat_nonuniform_pf = 0;
+static uint64_t stat_page_stop = 0, stat_dup_drop = 0;
+static uint64_t stat_epochs[DEG_HIGH + 1] = {0};
+
+// sign extend a value of given bit width
+static inline int64_t sext(uint64_t v, uint32_t bits)
+{
+    uint64_t m = 1ULL << (bits - 1);
+    v &= (1ULL << bits) - 1;
+    return (int64_t)((v ^ m) - m);
+}
+
+static inline uint8_t enc_stride(int64_t s) { return (uint8_t)(s & 0x7F); }
+static inline int64_t dec_stride(uint8_t e) { return sext(e, STRIDE_BITS); }
+
+// shift old signature and xor in the new stride
+static inline uint16_t next_sig(uint16_t sig, int64_t stride)
+{
+    return (uint16_t)(((sig << SIG_SHIFT) ^ enc_stride(stride)) & SIG_MASK);
+}
+
+static inline uint32_t pt_index(uint16_t sig)
+{
+    return (sig ^ (sig >> PT_INDEX_BITS)) & (PT_ENTRIES - 1);
+}
+
+// fold the whole IP down so different IPs dont clash much
+static inline uint64_t hash_ip(uint64_t ip)
+{
+    return ip ^ (ip >> 14) ^ (ip >> 28) ^ (ip >> 42) ^ (ip >> 56);
+}
+
+// learn: after this signature, this stride came
+static void pt_update(uint16_t sig, int64_t stride)
+{
+    PTEntry &p = pt[pt_index(sig)];
+    if (p.conf > 0 && dec_stride(p.stride) == stride) {
+        if (p.conf < CONF_MAX) p.conf++;
+    } else if (p.conf > 1) {
+        p.conf--;              // wrong guess, lower confidence first
+    } else {
+        p.stride = enc_stride(stride);
+        p.conf   = 1;
+    }
+}
+
+static inline uint32_t f_idx(uint64_t cl) { return cl & (FILTER_ENTRIES - 1); }
+static inline uint16_t f_tag(uint64_t cl) { return (cl >> FILTER_IDX_BITS) & FILTER_TAG_MASK; }
+
+static bool filter_contains(uint64_t cl)
+{
+    FilterEntry &f = filter[f_idx(cl)];
+    return f.valid && f.tag == f_tag(cl);
+}
+static void filter_insert(uint64_t cl)
+{
+    filter[f_idx(cl)].valid = true;
+    filter[f_idx(cl)].tag   = f_tag(cl);
+}
+static bool filter_check_and_clear(uint64_t cl)
+{
+    if (filter_contains(cl)) { filter[f_idx(cl)].valid = false; return true; }
+    return false;
+}
+
+// after every 256 prefetches, check accuracy and change degree
+static void maybe_end_epoch()
+{
+    if (epoch_issued < EPOCH_LEN) return;
+    double acc = (double)epoch_useful / (double)epoch_issued;
+    if      (acc >= ACC_HIGH) cur_degree = DEG_HIGH;
+    else if (acc >= ACC_MID)  cur_degree = DEG_MID;
+    else if (acc >= ACC_LOW)  cur_degree = DEG_LOW;
+    else                      cur_degree = DEG_MIN;
+    stat_epochs[cur_degree]++;
+    epoch_issued = epoch_useful = 0;
+}
+
+static void touch_lru(uint32_t set, uint32_t way)
+{
+    uint8_t old = ipt[set][way].lru;
+    for (uint32_t w = 0; w < IPT_WAYS; w++)
+        if (ipt[set][w].lru < old) ipt[set][w].lru++;
+    ipt[set][way].lru = 0;
+}
+
+} // namespace spp
 
 void CACHE::l1d_prefetcher_initialize()
 {
-    for (auto &entry : table)
-        entry = IPEntry();
+    using namespace spp;
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
 
-    std::cout << "SPP initialized" << std::endl;
+    for (uint32_t s = 0; s < IPT_SETS; s++)
+        for (uint32_t w = 0; w < IPT_WAYS; w++) {
+            ipt[s][w] = IPEntry();
+            ipt[s][w].lru = w;
+        }
+    for (uint32_t i = 0; i < PT_ENTRIES; i++)     pt[i] = PTEntry();
+    for (uint32_t i = 0; i < FILTER_ENTRIES; i++) filter[i] = FilterEntry();
+    cur_degree = INIT_DEGREE;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip,
-                                   uint8_t cache_hit, uint8_t type,
-                                   uint8_t critical_ip_flag)
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-    // Ignore prefetch requests
-    if (type == PREFETCH)
-        return;
+    using namespace spp;
+
+    if (type == PREFETCH) return;   // train only on demand accesses
 
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
-    IPEntry &entry = table[ip % 64];
 
-    // Initialize tracking for a new instruction
-    if (!entry.valid || entry.ip != ip) {
-        entry.ip = ip;
-        entry.last_addr = cl_addr;
-        entry.stride = 0;
-        entry.confidence = 0;
-        entry.valid = true;
+    // demand hit on a line we prefetched -> it was useful
+    if (filter_check_and_clear(cl_addr)) {
+        epoch_useful++;
+        stat_useful++;
+    }
+
+    uint64_t h   = hash_ip(ip);
+    uint32_t set = h & (IPT_SETS - 1);
+    uint16_t tag = (h >> IPT_SET_BITS) & IPT_TAG_MASK;
+
+    int way = -1;
+    for (uint32_t w = 0; w < IPT_WAYS; w++)
+        if (ipt[set][w].valid && ipt[set][w].tag == tag) { way = w; break; }
+
+    // new IP: take a free way or the LRU one
+    if (way == -1) {
+        for (uint32_t w = 0; w < IPT_WAYS; w++)
+            if (!ipt[set][w].valid) { way = w; break; }
+        if (way == -1)
+            for (uint32_t w = 0; w < IPT_WAYS; w++)
+                if (ipt[set][w].lru == IPT_WAYS - 1) { way = w; break; }
+
+        IPEntry &n   = ipt[set][way];
+        uint8_t  lru = n.lru;
+        n = IPEntry();
+        n.lru       = lru;
+        n.valid     = true;
+        n.tag       = tag;
+        n.last_addr = cl_addr & LAST_ADDR_MASK;
+        touch_lru(set, way);
         return;
     }
 
-    // Calculate the stride between consecutive accesses
-    int64_t stride = (int64_t)cl_addr - (int64_t)entry.last_addr;
-    entry.last_addr = cl_addr;
+    IPEntry &e = ipt[set][way];
+    touch_lru(set, way);
 
-    if (stride == 0)
+    // stride in cache lines from last access of this IP
+    uint64_t cur_low = cl_addr & LAST_ADDR_MASK;
+    int64_t  stride  = sext((cur_low - e.last_addr) & LAST_ADDR_MASK, LAST_ADDR_BITS);
+    e.last_addr = (uint16_t)cur_low;
+
+    if (stride == 0) return;
+
+    if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
+        // too far, probably new region, start learning again
+        e.conf = 0; e.last_stride = 0; e.sig = 0;
         return;
+    }
 
-    // Increase confidence when the stride repeats
-    if (stride == entry.stride) {
-        if (entry.confidence < 3)
-            entry.confidence++;
+    // uniform check: same stride again?
+    if (stride == e.last_stride) { if (e.conf < CONF_MAX) e.conf++; }
+    else                          e.conf = 0;
+    e.last_stride = (int8_t)stride;
+
+    // train pattern table, then update signature
+    pt_update(e.sig, stride);
+    e.sig = next_sig(e.sig, stride);
+
+    // returns false when the prefetch would cross the 4KB page
+    auto issue = [&](uint64_t pf_cl, uint64_t &counter) -> bool {
+        uint64_t pf_addr = pf_cl << LOG2_BLOCK_SIZE;
+        if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+            stat_page_stop++;
+            return false;
+        }
+        if (filter_contains(pf_cl)) {   // already prefetched
+            stat_dup_drop++;
+            return true;
+        }
+        // MSHR almost full -> put it in L2 instead
+        int fill = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+        if (prefetch_line(ip, addr, pf_addr, fill, 0)) {
+            filter_insert(pf_cl);
+            counter++;
+            epoch_issued++;
+            stat_issued++;
+            maybe_end_epoch();
+        }
+        return true;
+    };
+
+    int degree = cur_degree;
+
+    // uniform gets priority unless the PT confidently predicts a different
+    // next stride, e.g. (1,2,2,2) -> 3 in the (+1,+2,+2,+2,+3) pattern
+    const PTEntry &cur_pt = pt[pt_index(e.sig)];
+    bool pt_disagrees = (cur_pt.conf >= PT_CONF_THRESH) &&
+                        (dec_stride(cur_pt.stride) != stride);
+    bool use_uniform  = (e.conf >= UNIFORM_CONF_THRESH) && !pt_disagrees;
+
+    if (use_uniform) {
+        // A + stride, A + 2*stride, ...
+        for (int k = 1; k <= degree; k++) {
+            if (!issue(cl_addr + stride * k, stat_uniform_pf)) break;
+        }
     } else {
-        entry.stride = stride;
-        entry.confidence = 0;
+        // non-uniform: lookahead through the PT with a speculative signature
+        uint16_t spec_sig = e.sig;
+        uint64_t pf_cl    = cl_addr;
+        for (int k = 0; k < degree; k++) {
+            PTEntry &p = pt[pt_index(spec_sig)];
+            if (p.conf < PT_CONF_THRESH) break;
+            int64_t s = dec_stride(p.stride);
+            if (s == 0) break;
+            pf_cl += s;
+            if (!issue(pf_cl, stat_nonuniform_pf)) break;
+            spec_sig = next_sig(spec_sig, s);
+        }
     }
-
-    // Prefetch the next cache line after detecting a repeated stride
-    if (entry.confidence >= 1) {
-        int64_t next_cl = (int64_t)cl_addr + stride;
-
-        if (next_cl < 0)
-            return;
-
-        uint64_t pf_addr = (uint64_t)next_cl << LOG2_BLOCK_SIZE;
-
-        // Do not prefetch across a 4 KB page boundary
-        if ((pf_addr >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE))
-            prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
-    }
-
-    entry.stride = stride;
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
-                                      uint32_t set, uint32_t way,
-                                      uint8_t prefetch,
-                                      uint64_t v_evicted_addr,
-                                      uint64_t evicted_addr,
-                                      uint32_t metadata_in)
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+    using namespace spp;
+    // storage in bits
+    uint64_t ipt_bits = (uint64_t)IPT_SETS * IPT_WAYS * (1 + 10 + 16 + 7 + 2 + 12 + 2);
+    uint64_t pt_bits  = (uint64_t)PT_ENTRIES * (7 + 2);
+    uint64_t f_bits   = (uint64_t)FILTER_ENTRIES * (1 + 12);
+    uint64_t t_bits   = 9 + 9 + 3;
+
+    std::cout << "CPU " << cpu << " L1D SPP final stats" << std::endl;
+    std::cout << "SPP issued: " << stat_issued << "  useful(own filter): " << stat_useful
+              << "  accuracy(own): "
+              << (stat_issued ? 100.0 * stat_useful / stat_issued : 0.0) << "%" << std::endl;
+    std::cout << "SPP uniform prefetches: " << stat_uniform_pf
+              << "  non-uniform prefetches: " << stat_nonuniform_pf << std::endl;
+    std::cout << "SPP page-boundary stops: " << stat_page_stop
+              << "  duplicate drops: " << stat_dup_drop << std::endl;
+    std::cout << "SPP epochs at degree 1/2/3/4: "
+              << stat_epochs[1] << " / " << stat_epochs[2] << " / "
+              << stat_epochs[3] << " / " << stat_epochs[4] << std::endl;
+    std::cout << "SPP storage: IPT " << ipt_bits << " + PT " << pt_bits
+              << " + filter " << f_bits << " + throttle " << t_bits
+              << " = " << (ipt_bits + pt_bits + f_bits + t_bits) << " bits" << std::endl;
 }
