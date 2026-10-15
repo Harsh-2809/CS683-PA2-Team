@@ -110,6 +110,8 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 class CACHE : public MEMORY {
   public:
     uint32_t cpu;
+    // Current request's instruction flag for instruction-aware L2 replacement.
+    uint8_t l2c_current_instruction = 0;
     const string NAME;
     const uint32_t NUM_SET, NUM_WAY, NUM_LINE, WQ_SIZE, RQ_SIZE, PQ_SIZE, MSHR_SIZE;
     uint32_t LATENCY;

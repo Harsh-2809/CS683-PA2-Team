@@ -1,0 +1,155 @@
+#include "cache.h"
+#include <cstdlib>
+
+#define MAX_RRPV 3
+#define RRIP_LEADER_SETS 16
+#define IRRIP_LEADER_START 16
+#define IRRIP_LEADER_END 32
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+uint64_t total_accesses = 0;
+uint64_t total_misses = 0;
+uint64_t instruction_accesses = 0;
+uint64_t instruction_misses = 0;
+uint64_t data_accesses = 0;
+uint64_t data_misses = 0;
+
+uint8_t dynamic_use_irrip = 0;
+
+double get_irrip_threshold()
+{
+    const char* value = std::getenv("IRRIP_THRESHOLD");
+    if (value == nullptr)
+        return 0.25;
+
+    char* end = nullptr;
+    double threshold = std::strtod(value, &end);
+
+    if (end == value || *end != '\0' ||
+        threshold < 0.0 || threshold > 1.0)
+        return 0.25;
+
+    return threshold;
+}
+
+bool is_rrip_leader(uint32_t set)
+{
+    return set < RRIP_LEADER_SETS;
+}
+
+bool is_irrip_leader(uint32_t set)
+{
+    return set >= IRRIP_LEADER_START &&
+           set < IRRIP_LEADER_END;
+}
+
+bool use_irrip_for_set(uint32_t set)
+{
+    if (is_rrip_leader(set))
+        return false;
+
+    if (is_irrip_leader(set))
+        return true;
+
+    return dynamic_use_irrip;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C" << endl;
+
+    total_accesses = 0;
+    total_misses = 0;
+    instruction_accesses = 0;
+    instruction_misses = 0;
+    data_accesses = 0;
+    data_misses = 0;
+    dynamic_use_irrip = 0;
+
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way] = MAX_RRPV;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu, uint64_t instr_id, uint32_t set,
+    const BLOCK *current_set, uint64_t ip,
+    uint64_t full_addr, uint32_t type)
+{
+    while (true) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] >= MAX_RRPV)
+                return way;
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way]++;
+        }
+    }
+}
+
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu, uint32_t set, uint32_t way,
+    uint64_t full_addr, uint64_t ip, uint64_t victim_addr,
+    uint32_t type, uint8_t hit)
+{
+    const bool is_instruction = (l2c_current_instruction != 0);
+
+    // Collect statistics from the leader sets.
+    if (is_rrip_leader(set) || is_irrip_leader(set)) {
+        total_accesses++;
+
+        if (is_instruction)
+            instruction_accesses++;
+        else
+            data_accesses++;
+
+        if (!hit) {
+            total_misses++;
+
+            if (is_instruction)
+                instruction_misses++;
+            else
+                data_misses++;
+        }
+
+        const double denominator =
+            static_cast<double>(total_accesses + total_misses);
+
+        double score = 0.0;
+        if (denominator > 0.0) {
+            score = static_cast<double>(
+                instruction_accesses + instruction_misses
+            ) / denominator;
+        }
+
+        dynamic_use_irrip = (score > get_irrip_threshold());
+    }
+
+    if (hit) {
+        l2_rrpv[set][way] = 0;
+    } else if (use_irrip_for_set(set) && !is_instruction) {
+        // I-RRIP variant: insert data lines at the eviction-prone RRPV.
+        l2_rrpv[set][way] = MAX_RRPV;
+    } else {
+        // SRRIP insertion.
+        l2_rrpv[set][way] = MAX_RRPV - 1;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "\nDynamic I-RRIP statistics (L2C)" << endl;
+    cout << "Leader-set accesses: " << total_accesses << endl;
+    cout << "Leader-set misses: " << total_misses << endl;
+    cout << "Instruction accesses: " << instruction_accesses << endl;
+    cout << "Instruction misses: " << instruction_misses << endl;
+    cout << "Data accesses: " << data_accesses << endl;
+    cout << "Data misses: " << data_misses << endl;
+    cout << "Threshold: " << get_irrip_threshold() << endl;
+    cout << "Follower policy: "
+         << (dynamic_use_irrip ? "I-RRIP" : "RRIP") << endl;
+}

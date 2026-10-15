@@ -1,0 +1,32 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>CS683 PA2 Dynamic I-RRIP</title>
+<style>
+body{font-family:Arial,sans-serif;margin:32px;color:#202833;line-height:1.45}
+h1,h2{color:#17365d}table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{border:1px solid #aaa;padding:7px;text-align:center}
+th{background:#eaf0f7}img{width:100%;max-width:760px}
+</style></head><body>
+<h1>CS683 PA2: Dynamic I-RRIP</h1>
+<p>Trace1.gz; single-core ChampSim; 25 million warmup and 25 million simulation instructions.</p>
+<h2>Experimental results</h2>
+<table><tr><th>Threshold</th><th>IPC</th><th>Speedup</th><th>Total MPKI</th>
+<th>Data-load MPKI</th><th>Instruction-load MPKI</th><th>Follower policy</th></tr>
+<tr><td>baseline</td><td>0.232232</td><td>1.000000x</td><td>23.7991</td><td>7.06972</td><td>10.5255</td><td>SRRIP</td></tr>
+<tr><td>0.10</td><td>0.232178</td><td>0.999767x</td><td>28.5422</td><td>8.67768</td><td>9.66028</td><td>I-RRIP</td></tr>
+<tr><td>0.25</td><td>0.232396</td><td>1.000706x</td><td>28.5162</td><td>8.65824</td><td>9.6566</td><td>I-RRIP</td></tr>
+<tr><td>0.50</td><td>0.232250</td><td>1.000078x</td><td>23.8616</td><td>7.09548</td><td>10.5098</td><td>RRIP</td></tr>
+<tr><td>0.75</td><td>0.232250</td><td>1.000078x</td><td>23.8616</td><td>7.09548</td><td>10.5098</td><td>RRIP</td></tr>
+<tr><td>0.90</td><td>0.232250</td><td>1.000078x</td><td>23.8616</td><td>7.09548</td><td>10.5098</td><td>RRIP</td></tr>
+</table>
+<h2>IPC by threshold</h2><img src="ipc_plot.svg">
+<h2>Total L2C MPKI by threshold</h2><img src="mpki_plot.svg">
+<h2>Discussion</h2>
+<p>Baseline SRRIP IPC is 0.232232. Threshold 0.25 has IPC 0.232396,
+but total L2C MPKI rises from 23.7991 to 28.5162. Instruction-load MPKI
+falls while data-load MPKI rises, indicating a trade-off rather than a
+substantial overall performance improvement.</p>
+<p>Thresholds 0.50, 0.75 and 0.90 have identical measured results and
+finish with RRIP as the follower policy. Thresholds 0.10 and 0.25 finish
+with I-RRIP. Only Trace1 was available for this sweep, so results should
+not be generalized to other workloads.</p>
+</body></html>
