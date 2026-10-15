@@ -1,0 +1,111 @@
+#include "cache.h"
+
+// I-RRIP at L2C
+// same as SRRIP but instruction lines get more priority than data
+// rrpv 0 means keep it, rrpv 3 means evict it first
+//
+// insert : instr at 1, data at 2
+// hit    : instr goes to 0, data goes to 1, writeback hit not changed
+// evict  : take a data line at rrpv 3 first, instr line only if no data line is there
+
+#define maxRRPV 3
+
+#define INSTR_INSERT_RRPV  1
+#define DATA_INSERT_RRPV   2
+
+#define INSTR_HIT_RRPV     0
+#define DATA_HIT_RRPV      1
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// counters for final stats
+uint64_t irrip_instr_fill = 0, irrip_data_fill = 0;
+uint64_t irrip_instr_hit = 0, irrip_data_hit = 0;
+uint64_t irrip_evict_instr = 0, irrip_evict_data = 0;
+
+// page walk lines also come with instruction flag, treat them as data
+static inline bool is_instr_line(uint32_t type, uint8_t isInstruction)
+{
+    return isInstruction && (type == LOAD || type == PREFETCH);
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // use empty way if there is one
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    while (1) {
+        // data line at rrpv 3
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction) {
+                irrip_evict_data++;
+                return i;
+            }
+
+        // no data line, so evict instr line at rrpv 3
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) {
+                irrip_evict_instr++;
+                return i;
+            }
+
+        // nothing at 3, increase all and check again
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+// called on hit and on fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool instr = is_instr_line(type, isInstruction);
+
+    if (hit) {
+        // writeback is not real reuse, so no promotion
+        if (type == WRITEBACK)
+            return;
+
+        if (instr) {
+            l2_rrpv[set][way] = INSTR_HIT_RRPV;
+            irrip_instr_hit++;
+        } else {
+            // data also promoted but one level below instr
+            l2_rrpv[set][way] = DATA_HIT_RRPV;
+            irrip_data_hit++;
+        }
+        return;
+    }
+
+    // miss, new line inserted
+    if (instr) {
+        l2_rrpv[set][way] = INSTR_INSERT_RRPV;
+        irrip_instr_fill++;
+    } else {
+        l2_rrpv[set][way] = DATA_INSERT_RRPV;
+        irrip_data_fill++;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "I-RRIP fills  instr: " << irrip_instr_fill << "  data: " << irrip_data_fill << endl;
+    cout << "I-RRIP hits   instr: " << irrip_instr_hit << "  data: " << irrip_data_hit << endl;
+    cout << "I-RRIP evicts instr: " << irrip_evict_instr << "  data: " << irrip_evict_data << endl;
+}
