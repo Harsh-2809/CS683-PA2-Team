@@ -54,7 +54,32 @@ th{background:#eaf0f7}img{width:100%;max-width:760px}
 </style></head><body>
 <h1>CS683 PA2: Dynamic I-RRIP</h1>
 <p>Trace1.gz; single-core ChampSim; 25 million warmup and 25 million simulation instructions.</p>
+
+<h2>Methodology</h2>
+<p><b>Policy design:</b> Dynamic I-RRIP uses set dueling at L2. Sets 0–15
+are fixed SRRIP leader sets, sets 16–31 are fixed I-RRIP leader sets,
+and all remaining sets are follower sets controlled by the selector.</p>
+
+<p><b>Selector statistic:</b> Counters are updated for accesses to either
+group of leader sets. Let I_A and I_M be instruction accesses and misses,
+and A and M be total accesses and misses in those leader sets. The score is</p>
+<p style="text-align:center"><b>score = (I_A + I_M) / (A + M)</b></p>
+<p>The selector chooses I-RRIP for follower sets when score exceeds the
+configured threshold; otherwise it chooses SRRIP. The default threshold is
+0.25, and the experiment varies it across five values.</p>
+
+<p><b>Insertion and victim selection:</b> Hits reset the accessed line's
+RRPV to 0. On a miss, the implementation inserts instruction lines at
+RRPV 2. Under I-RRIP, data lines are inserted at RRPV 3; otherwise, lines
+are inserted at RRPV 2. Victim selection chooses a line at RRPV 3, increasing
+RRPVs when necessary until a victim is available.</p>
+
+<p><b>Experimental setup:</b> Single-core ChampSim, Trace1.gz, 25 million
+warmup instructions followed by 25 million simulation instructions.
+The results represent this trace and configuration only.</p>
+
 <h2>Experimental results</h2>
+
 <table><tr><th>Threshold</th><th>IPC</th><th>Speedup</th><th>Total MPKI</th>
 <th>Data-load MPKI</th><th>Instruction-load MPKI</th><th>Follower policy</th></tr>
 """)
